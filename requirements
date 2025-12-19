@@ -1,0 +1,5 @@
+streamlit==1.38.0
+requests==2.32.3
+pandas==2.2.2
+python-dateutil==2.9.0.post0
+altair==5.4.1
