@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import time
 import json
+from datetime import datetime
+from zoneinfo import ZoneInfo
+from pathlib import Path
 from typing import Dict, Optional, List, Tuple
 
 import streamlit as st
@@ -35,6 +38,55 @@ st.title("Polymarket Wallet Trade Analyzer — Report")
 
 TRADES_URL = "https://data-api.polymarket.com/trades"
 PRICE_RESOLUTION_THRESHOLD = 0.5  # like your script
+
+
+# ----------------------------
+# BTC 15m convenience (latest/prev/next)
+# ----------------------------
+SAVED_WALLETS_FILE = "saved_wallets.json"
+
+
+def btc_15m_slug(offset_slots: int = 0) -> str:
+    """Return Polymarket Gamma slug for BTC up/down 15m at current slot + offset (±1 = ±15m)."""
+    now_ny = datetime.now(tz=ZoneInfo("America/New_York"))
+    slot_minute = (now_ny.minute // 15) * 15
+    slot_start_ny = now_ny.replace(minute=slot_minute, second=0, microsecond=0)
+    base_ts = int(slot_start_ny.astimezone(ZoneInfo("UTC")).timestamp())
+    ts = base_ts + int(offset_slots) * 900
+    return f"btc-updown-15m-{ts}"
+
+
+def load_saved_wallets() -> List[str]:
+    try:
+        p = Path(SAVED_WALLETS_FILE)
+        if not p.exists():
+            return []
+        data = json.loads(p.read_text(encoding="utf-8"))
+        if not isinstance(data, list):
+            return []
+        out = []
+        for x in data:
+            if isinstance(x, str) and x.strip():
+                out.append(x.strip().lower())
+        seen = set()
+        dedup = []
+        for w in out:
+            if w not in seen:
+                seen.add(w)
+                dedup.append(w)
+        return dedup
+    except Exception:
+        return []
+
+
+def save_saved_wallets(wallets: List[str]) -> None:
+    try:
+        Path(SAVED_WALLETS_FILE).write_text(
+            json.dumps(wallets, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+    except Exception:
+        pass
 
 
 # ----------------------------
@@ -478,10 +530,67 @@ def pair_final_pnl_inferred(df: pd.DataFrame, winner_outcome: str) -> float:
 # UI
 # ============================
 colA, colB = st.columns([2, 3])
+
+# --- Saved wallets (optional convenience) ---
+if "wallet_in" not in st.session_state:
+    st.session_state.wallet_in = ""
+if "wallet_select" not in st.session_state:
+    st.session_state.wallet_select = "(manual)"
+
 with colA:
-    wallet_in = st.text_input("Wallet (0x...)", value="", placeholder="0x1234...")
+    saved_wallets = load_saved_wallets()
+    opts = ["(manual)"] + saved_wallets
+    sel = st.selectbox("Saved wallets", opts, index=0, key="wallet_select")
+    if sel != "(manual)":
+        st.session_state.wallet_in = sel
+
+    wallet_in = st.text_input("Wallet (0x...)", value=st.session_state.wallet_in, placeholder="0x1234...", key="wallet_input")
+
+    c1, c2 = st.columns([1, 1])
+    with c1:
+        if st.button("Save wallet", use_container_width=True):
+            try:
+                w = normalize_address(wallet_in)
+                if w not in saved_wallets:
+                    saved_wallets.append(w)
+                    save_saved_wallets(saved_wallets)
+                    st.success("Saved.")
+            except Exception:
+                st.warning("Invalid wallet; cannot save.")
+    with c2:
+        if st.button("Clear", use_container_width=True):
+            st.session_state.wallet_in = ""
+            st.session_state.wallet_select = "(manual)"
+            st.rerun()
+
+# --- Market navigation (latest / prev / next 15m) ---
+if "market_offset" not in st.session_state:
+    st.session_state.market_offset = 0
+if "market_in" not in st.session_state:
+    st.session_state.market_in = btc_15m_slug(0)
+
 with colB:
-    market_in = st.text_input("Market (slug / conditionId / URL)", value="")
+    b1, b2, b3, b4 = st.columns([1, 1, 6, 1])
+    with b1:
+        if st.button("◀", help="Previous 15m market", use_container_width=True):
+            st.session_state.market_offset -= 1
+            st.session_state.market_in = btc_15m_slug(st.session_state.market_offset)
+    with b2:
+        if st.button("Latest", help="Jump to latest 15m market", use_container_width=True):
+            st.session_state.market_offset = 0
+            st.session_state.market_in = btc_15m_slug(0)
+    with b3:
+        market_in = st.text_input(
+            "Market (slug / conditionId / URL)",
+            value=st.session_state.market_in,
+            key="market_input",
+        )
+        st.session_state.market_in = market_in
+    with b4:
+        if st.button("▶", help="Next 15m market", use_container_width=True):
+            st.session_state.market_offset += 1
+            st.session_state.market_in = btc_15m_slug(st.session_state.market_offset)
+
 
 st.divider()
 
