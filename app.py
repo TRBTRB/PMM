@@ -536,21 +536,35 @@ if "wallet_in" not in st.session_state:
     st.session_state.wallet_in = ""
 if "wallet_select" not in st.session_state:
     st.session_state.wallet_select = "(manual)"
+# Bind the input widget state so dropdown selection actually updates the input field
+if "wallet_input" not in st.session_state:
+    st.session_state.wallet_input = st.session_state.wallet_in
 
 with colA:
     saved_wallets = load_saved_wallets()
     opts = ["(manual)"] + saved_wallets
-    sel = st.selectbox("Saved wallets", opts, index=0, key="wallet_select")
-    if sel != "(manual)":
-        st.session_state.wallet_in = sel
+    st.selectbox("Saved wallets", opts, index=0, key="wallet_select")
 
-    wallet_in = st.text_input("Wallet (0x...)", value=st.session_state.wallet_in, placeholder="0x1234...", key="wallet_input")
+    # If user picked a saved wallet, push it into the input widget state
+    if st.session_state.wallet_select != "(manual)":
+        st.session_state.wallet_in = st.session_state.wallet_select
+        st.session_state.wallet_input = st.session_state.wallet_select
+
+    wallet_in = st.text_input(
+        "Wallet (0x...)",
+        value=st.session_state.wallet_input,
+        placeholder="0x1234...",
+        key="wallet_input",
+    )
+    # Keep canonical wallet_in in sync with what user typed
+    st.session_state.wallet_in = wallet_in
 
     c1, c2 = st.columns([1, 1])
     with c1:
         if st.button("Save wallet", use_container_width=True):
             try:
                 w = normalize_address(wallet_in)
+                saved_wallets = load_saved_wallets()
                 if w not in saved_wallets:
                     saved_wallets.append(w)
                     save_saved_wallets(saved_wallets)
@@ -560,36 +574,50 @@ with colA:
     with c2:
         if st.button("Clear", use_container_width=True):
             st.session_state.wallet_in = ""
+            st.session_state.wallet_input = ""
             st.session_state.wallet_select = "(manual)"
             st.rerun()
 
 # --- Market navigation (latest / prev / next 15m) ---
-if "market_offset" not in st.session_state:
-    st.session_state.market_offset = 0
+# Keep the market input widget state as the source of truth so buttons actually change what's shown.
 if "market_in" not in st.session_state:
     st.session_state.market_in = btc_15m_slug(0)
+if "market_input" not in st.session_state:
+    st.session_state.market_input = st.session_state.market_in
+
+def _parse_btc15m_ts(slug: str) -> Optional[int]:
+    try:
+        s = (slug or "").strip()
+        if s.startswith("btc-updown-15m-"):
+            tail = s.split("-")[-1]
+            return int(tail)
+    except Exception:
+        pass
+    return None
 
 with colB:
     b1, b2, b3, b4 = st.columns([1, 1, 6, 1])
     with b1:
         if st.button("◀", help="Previous 15m market", use_container_width=True):
-            st.session_state.market_offset -= 1
-            st.session_state.market_in = btc_15m_slug(st.session_state.market_offset)
+            cur = _parse_btc15m_ts(st.session_state.market_input) or _parse_btc15m_ts(btc_15m_slug(0))
+            st.session_state.market_input = f"btc-updown-15m-{cur - 900}"
+            st.session_state.market_in = st.session_state.market_input
     with b2:
         if st.button("Latest", help="Jump to latest 15m market", use_container_width=True):
-            st.session_state.market_offset = 0
-            st.session_state.market_in = btc_15m_slug(0)
+            st.session_state.market_input = btc_15m_slug(0)
+            st.session_state.market_in = st.session_state.market_input
     with b3:
         market_in = st.text_input(
             "Market (slug / conditionId / URL)",
-            value=st.session_state.market_in,
+            value=st.session_state.market_input,
             key="market_input",
         )
         st.session_state.market_in = market_in
     with b4:
         if st.button("▶", help="Next 15m market", use_container_width=True):
-            st.session_state.market_offset += 1
-            st.session_state.market_in = btc_15m_slug(st.session_state.market_offset)
+            cur = _parse_btc15m_ts(st.session_state.market_input) or _parse_btc15m_ts(btc_15m_slug(0))
+            st.session_state.market_input = f"btc-updown-15m-{cur + 900}"
+            st.session_state.market_in = st.session_state.market_input
 
 
 st.divider()
