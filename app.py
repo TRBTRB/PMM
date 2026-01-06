@@ -2,9 +2,6 @@ from __future__ import annotations
 
 import time
 import json
-from datetime import datetime
-from zoneinfo import ZoneInfo
-from pathlib import Path
 from typing import Dict, Optional, List, Tuple
 
 import streamlit as st
@@ -41,52 +38,58 @@ PRICE_RESOLUTION_THRESHOLD = 0.5  # like your script
 
 
 # ----------------------------
-# BTC 15m convenience (latest/prev/next)
+# Navigation / Session
 # ----------------------------
-SAVED_WALLETS_FILE = "saved_wallets.json"
+if "page" not in st.session_state:
+    st.session_state.page = "market"  # market | profile
 
-
-def btc_15m_slug(offset_slots: int = 0) -> str:
-    """Return Polymarket Gamma slug for BTC up/down 15m at current slot + offset (±1 = ±15m)."""
-    now_ny = datetime.now(tz=ZoneInfo("America/New_York"))
-    slot_minute = (now_ny.minute // 15) * 15
-    slot_start_ny = now_ny.replace(minute=slot_minute, second=0, microsecond=0)
-    base_ts = int(slot_start_ny.astimezone(ZoneInfo("UTC")).timestamp())
-    ts = base_ts + int(offset_slots) * 900
-    return f"btc-updown-15m-{ts}"
-
-
-def load_saved_wallets() -> List[str]:
+# Optional query-param navigation (so cards can deep-link into the market analyzer)
+try:
+    q = st.query_params  # streamlit >= 1.32
+    if "page" in q and str(q.get("page", "")).strip():
+        st.session_state.page = str(q.get("page")).strip()
+    if "wallet" in q and str(q.get("wallet", "")).strip():
+        st.session_state.prefill_wallet = str(q.get("wallet")).strip()
+    if "market" in q and str(q.get("market", "")).strip():
+        st.session_state.prefill_market = str(q.get("market")).strip()
+except Exception:
+    # Back-compat (older streamlit)
     try:
-        p = Path(SAVED_WALLETS_FILE)
-        if not p.exists():
-            return []
-        data = json.loads(p.read_text(encoding="utf-8"))
-        if not isinstance(data, list):
-            return []
-        out = []
-        for x in data:
-            if isinstance(x, str) and x.strip():
-                out.append(x.strip().lower())
-        seen = set()
-        dedup = []
-        for w in out:
-            if w not in seen:
-                seen.add(w)
-                dedup.append(w)
-        return dedup
-    except Exception:
-        return []
-
-
-def save_saved_wallets(wallets: List[str]) -> None:
-    try:
-        Path(SAVED_WALLETS_FILE).write_text(
-            json.dumps(wallets, ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
+        qp = st.experimental_get_query_params()
+        if "page" in qp and qp["page"]:
+            st.session_state.page = str(qp["page"][0]).strip()
+        if "wallet" in qp and qp["wallet"]:
+            st.session_state.prefill_wallet = str(qp["wallet"][0]).strip()
+        if "market" in qp and qp["market"]:
+            st.session_state.prefill_market = str(qp["market"][0]).strip()
     except Exception:
         pass
+
+with st.sidebar:
+    st.markdown("### Views")
+    cnav1, cnav2 = st.columns(2)
+    with cnav1:
+        if st.button("Market Analyzer", use_container_width=True):
+            st.session_state.page = "market"
+            try:
+                st.query_params["page"] = "market"
+            except Exception:
+                try:
+                    st.experimental_set_query_params(page="market")
+                except Exception:
+                    pass
+            st.rerun()
+    with cnav2:
+        if st.button("Trader Profile", use_container_width=True):
+            st.session_state.page = "profile"
+            try:
+                st.query_params["page"] = "profile"
+            except Exception:
+                try:
+                    st.experimental_set_query_params(page="profile")
+                except Exception:
+                    pass
+            st.rerun()
 
 
 # ----------------------------
@@ -527,98 +530,445 @@ def pair_final_pnl_inferred(df: pd.DataFrame, winner_outcome: str) -> float:
 
 
 # ============================
-# UI
+# Trader Profile View
 # ============================
-colA, colB = st.columns([2, 3])
-
-# --- Saved wallets (optional convenience) ---
-if "wallet_in" not in st.session_state:
-    st.session_state.wallet_in = ""
-if "wallet_select" not in st.session_state:
-    st.session_state.wallet_select = "(manual)"
-# Bind the input widget state so dropdown selection actually updates the input field
-if "wallet_input" not in st.session_state:
-    st.session_state.wallet_input = st.session_state.wallet_in
-
-with colA:
-    saved_wallets = load_saved_wallets()
-    opts = ["(manual)"] + saved_wallets
-    st.selectbox("Saved wallets", opts, index=0, key="wallet_select")
-
-    # If user picked a saved wallet, push it into the input widget state
-    if st.session_state.wallet_select != "(manual)":
-        st.session_state.wallet_in = st.session_state.wallet_select
-        st.session_state.wallet_input = st.session_state.wallet_select
-
-    wallet_in = st.text_input(
-        "Wallet (0x...)",
-        value=st.session_state.wallet_input,
-        placeholder="0x1234...",
-        key="wallet_input",
-    )
-    # Keep canonical wallet_in in sync with what user typed
-    st.session_state.wallet_in = wallet_in
-
-    c1, c2 = st.columns([1, 1])
-    with c1:
-        if st.button("Save wallet", use_container_width=True):
-            try:
-                w = normalize_address(wallet_in)
-                saved_wallets = load_saved_wallets()
-                if w not in saved_wallets:
-                    saved_wallets.append(w)
-                    save_saved_wallets(saved_wallets)
-                    st.success("Saved.")
-            except Exception:
-                st.warning("Invalid wallet; cannot save.")
-    with c2:
-        if st.button("Clear", use_container_width=True):
-            st.session_state.wallet_in = ""
-            st.session_state.wallet_input = ""
-            st.session_state.wallet_select = "(manual)"
-            st.rerun()
-
-# --- Market navigation (latest / prev / next 15m) ---
-# Keep the market input widget state as the source of truth so buttons actually change what's shown.
-if "market_in" not in st.session_state:
-    st.session_state.market_in = btc_15m_slug(0)
-if "market_input" not in st.session_state:
-    st.session_state.market_input = st.session_state.market_in
-
-def _parse_btc15m_ts(slug: str) -> Optional[int]:
+def _seconds_until_next_quarter() -> int:
+    """Seconds until next :00/:15/:30/:45 boundary (UTC)."""
     try:
-        s = (slug or "").strip()
-        if s.startswith("btc-updown-15m-"):
-            tail = s.split("-")[-1]
-            return int(tail)
+        now = time.time()
+        sec = int(now)
+        # next boundary in unix seconds
+        step = 15 * 60
+        next_ts = ((sec // step) + 1) * step
+        return max(1, int(next_ts - sec))
     except Exception:
-        pass
+        return 900
+
+
+def fetch_trades_all_user(user_address: str, max_pages: int = 60) -> List[dict]:
+    """Best-effort: fetches user's trades across markets from Data-API."""
+    all_trades: List[dict] = []
+    seen: set[str] = set()
+
+    limit = 500
+    offset = 0
+    pages = 0
+
+    while True:
+        params = {
+            "limit": limit,
+            "offset": offset,
+            "takerOnly": "false",
+            "user": user_address,
+        }
+        resp = requests.get(TRADES_URL, params=params, timeout=25)
+        resp.raise_for_status()
+        data = resp.json()
+
+        if isinstance(data, dict):
+            batch = data.get("trades", [])
+        elif isinstance(data, list):
+            batch = data
+        else:
+            batch = []
+
+        if not batch:
+            break
+
+        new_count = 0
+        for t in batch:
+            tx = t.get("transactionHash")
+            # If tx is missing, still include but do not dedupe
+            if tx and tx in seen:
+                continue
+            if tx:
+                seen.add(tx)
+            all_trades.append(t)
+            new_count += 1
+
+        offset += limit
+        pages += 1
+
+        # Stop if backend repeats pages endlessly OR we reached our cap.
+        if new_count == 0 or pages >= max_pages:
+            break
+
+    return all_trades
+
+
+def _trade_market_key(t: dict) -> Optional[str]:
+    for k in ("market", "conditionId", "condition_id", "condition", "marketId"):
+        v = t.get(k)
+        if isinstance(v, str) and v.strip():
+            return v.strip()
     return None
 
-with colB:
-    b1, b2, b3, b4 = st.columns([1, 1, 6, 1])
-    with b1:
-        if st.button("◀", help="Previous 15m market", use_container_width=True):
-            cur = _parse_btc15m_ts(st.session_state.market_input) or _parse_btc15m_ts(btc_15m_slug(0))
-            st.session_state.market_input = f"btc-updown-15m-{cur - 900}"
-            st.session_state.market_in = st.session_state.market_input
-    with b2:
-        if st.button("Latest", help="Jump to latest 15m market", use_container_width=True):
-            st.session_state.market_input = btc_15m_slug(0)
-            st.session_state.market_in = st.session_state.market_input
-    with b3:
-        market_in = st.text_input(
-            "Market (slug / conditionId / URL)",
-            value=st.session_state.market_input,
-            key="market_input",
-        )
-        st.session_state.market_in = market_in
-    with b4:
-        if st.button("▶", help="Next 15m market", use_container_width=True):
-            cur = _parse_btc15m_ts(st.session_state.market_input) or _parse_btc15m_ts(btc_15m_slug(0))
-            st.session_state.market_input = f"btc-updown-15m-{cur + 900}"
-            st.session_state.market_in = st.session_state.market_input
 
+@st.cache_data(show_spinner=False, ttl=60 * 15)
+def _market_meta_for_condition(condition_or_slug: str) -> dict:
+    try:
+        return resolve_market(condition_or_slug)
+    except Exception:
+        # If the key is a conditionId, try that. If it's not, just return empty.
+        try:
+            if str(condition_or_slug).startswith("0x") and len(str(condition_or_slug)) == 66:
+                return resolve_market(str(condition_or_slug))
+        except Exception:
+            pass
+        return {}
+
+
+def _filter_df_by_range(df: pd.DataFrame, rng: str) -> pd.DataFrame:
+    if df.empty:
+        return df
+    now = int(time.time())
+    if rng == "1D":
+        cutoff = now - 86400
+        return df[df["timestamp"] >= cutoff].copy()
+    if rng == "1W":
+        cutoff = now - 7 * 86400
+        return df[df["timestamp"] >= cutoff].copy()
+    if rng == "1M":
+        cutoff = now - 30 * 86400
+        return df[df["timestamp"] >= cutoff].copy()
+    return df.copy()
+
+
+def _pnl_series_from_trades(df: pd.DataFrame, mids_by_asset: Dict[str, Optional[float]]) -> pd.DataFrame:
+    """Equity curve proxy: net cashflow + mark-to-market at CURRENT mids, updated on each trade."""
+    if df.empty:
+        return pd.DataFrame(columns=["time_utc", "pnl"])
+
+    d = df.sort_values("timestamp", ascending=True).copy()
+    net_cf = 0.0
+    token_net: Dict[str, float] = {}
+    rows = []
+
+    for _, r in d.iterrows():
+        side = str(r.get("side") or "").upper()
+        token = str(r.get("asset") or "")
+        notional = float(r.get("notional") or 0.0)
+        size = float(r.get("size") or 0.0)
+
+        if side == "BUY":
+            net_cf -= notional
+            token_net[token] = token_net.get(token, 0.0) + size
+        elif side == "SELL":
+            net_cf += notional
+            token_net[token] = token_net.get(token, 0.0) - size
+
+        m2m = 0.0
+        for tok, sh in token_net.items():
+            mid = mids_by_asset.get(tok)
+            if mid is None:
+                continue
+            m2m += float(sh) * float(mid)
+
+        rows.append({
+            "time_utc": r.get("time_utc"),
+            "pnl": float(net_cf + m2m),
+        })
+
+    return pd.DataFrame(rows).dropna()
+
+
+def _render_trade_card(summary: dict, key: str):
+    """A compact 'card' for a paired position in a single market."""
+    title = summary.get("title") or "Market"
+    sub = summary.get("subtitle") or ""
+    pnl = float(summary.get("pnl", 0.0))
+    cost = float(summary.get("cost", 0.0))
+    worst = float(summary.get("worst", 0.0))
+    best = float(summary.get("best", 0.0))
+    avg = float(summary.get("avg", 0.0))
+    med = float(summary.get("median", 0.0))
+    imbalance = summary.get("imbalance") or "—"
+    flips = int(summary.get("flips", 0))
+
+    # Card UI
+    st.markdown(
+        """
+        <style>
+        .pm-card {background: #f8fafc; border: 1px solid #e5e7eb; border-radius: 16px; padding: 16px;}
+        .pm-title {font-size: 22px; font-weight: 700; margin-bottom: 2px;}
+        .pm-sub {color: #6b7280; margin-bottom: 10px;}
+        .pm-row {display:flex; justify-content:space-between; align-items:baseline; gap:12px; flex-wrap:wrap;}
+        .pm-big {font-size: 34px; font-weight: 800;}
+        .pm-pill {display:inline-block; padding: 6px 10px; border-radius: 999px; font-weight: 700; font-size: 13px; border: 1px solid #e5e7eb; background: white;}
+        .pm-metrics {display:flex; gap: 18px; flex-wrap:wrap; margin-top: 12px; color:#111827;}
+        .pm-metric {min-width: 120px;}
+        .pm-label {color:#6b7280; font-size: 13px; margin-bottom: 2px;}
+        .pm-val {font-weight: 800; font-size: 18px;}
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    pnl_str = format_money(pnl)
+    cost_str = format_money(cost)
+
+    st.markdown(
+        f"""
+        <div class="pm-card">
+          <div class="pm-row">
+            <div>
+              <div class="pm-title">{title}</div>
+              <div class="pm-sub">{sub}</div>
+              <div class="pm-pill">Cost: {cost_str}</div>
+            </div>
+            <div class="pm-big">{pnl_str}</div>
+          </div>
+          <div class="pm-metrics">
+            <div class="pm-metric"><div class="pm-label">Worst</div><div class="pm-val">{format_money(worst)}</div></div>
+            <div class="pm-metric"><div class="pm-label">Best</div><div class="pm-val">{format_money(best)}</div></div>
+            <div class="pm-metric"><div class="pm-label">Avg</div><div class="pm-val">{format_money(avg)}</div></div>
+            <div class="pm-metric"><div class="pm-label">Median</div><div class="pm-val">{format_money(med)}</div></div>
+            <div class="pm-metric"><div class="pm-label">Imbalance</div><div class="pm-val">{imbalance}</div></div>
+            <div class="pm-metric"><div class="pm-label">Flips</div><div class="pm-val">{flips}</div></div>
+          </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    b1, b2 = st.columns([1.1, 1.9])
+    with b1:
+        if st.button("Open market analysis", key=f"go_{key}", use_container_width=True):
+            st.session_state.page = "market"
+            st.session_state.prefill_wallet = summary.get("wallet") or ""
+            st.session_state.prefill_market = summary.get("market") or ""
+            try:
+                st.query_params["page"] = "market"
+                st.query_params["wallet"] = st.session_state.prefill_wallet
+                st.query_params["market"] = st.session_state.prefill_market
+            except Exception:
+                try:
+                    st.experimental_set_query_params(page="market", wallet=st.session_state.prefill_wallet, market=st.session_state.prefill_market)
+                except Exception:
+                    pass
+            st.rerun()
+    with b2:
+        # Best-effort popup (Streamlit 1.32+)
+        try:
+            @st.dialog("Trade Pair Details")
+            def _dlg():
+                st.write(f"**Market:** {title}")
+                st.write(f"**Market key:** {summary.get('market')}")
+                st.write(f"**Wallet:** {summary.get('wallet')}")
+                st.write(f"**Cost:** {cost_str}")
+                st.write(f"**PnL (open est):** {pnl_str}")
+                st.write("---")
+                st.dataframe(summary.get("df_trades"), use_container_width=True, hide_index=True)
+
+            if st.button("View details (popup)", key=f"dlg_{key}", use_container_width=True):
+                _dlg()
+        except Exception:
+            # Fallback: expander
+            with st.expander("View details"):
+                st.dataframe(summary.get("df_trades"), use_container_width=True, hide_index=True)
+
+
+def render_trader_profile_page():
+    st.header("Trader Profile")
+
+    # Auto-refresh aligned to :00/:15/:30/:45
+    next_in = _seconds_until_next_quarter()
+    try:
+        st.autorefresh(interval=next_in * 1000, key="profile_autorefresh")
+    except Exception:
+        try:
+            from streamlit_autorefresh import st_autorefresh
+
+            st_autorefresh(interval=next_in * 1000, key="profile_autorefresh")
+        except Exception:
+            pass
+
+    col1, col2, col3 = st.columns([2.2, 1.2, 2.6])
+    with col1:
+        wallet_in = st.text_input(
+            "Trader wallet (0x...)",
+            value=str(getattr(st.session_state, "prefill_wallet", "")) or "",
+            placeholder="0x1234...",
+            key="profile_wallet",
+        )
+    with col2:
+        try:
+            rng = st.segmented_control("Range", options=["ALL", "1M", "1W", "1D"], default="1W")
+        except Exception:
+            rng = st.selectbox("Range", ["ALL", "1M", "1W", "1D"], index=2)
+    with col3:
+        st.caption("Auto-refreshes on quarter-hours (UTC): :00 / :15 / :30 / :45")
+        st.caption(f"Next refresh in ~{next_in}s")
+
+    if not (wallet_in or "").strip():
+        st.info("Paste a wallet to analyze.")
+        st.stop()
+
+    try:
+        wallet = normalize_address(wallet_in)
+    except PMError as e:
+        st.error(str(e))
+        st.stop()
+
+    with st.spinner("Fetching trader trades…"):
+        try:
+            trades = fetch_trades_all_user(wallet)
+        except Exception as e:
+            st.error(f"Error fetching trades: {e}")
+            st.stop()
+
+    df_all = trades_to_df(trades)
+    if df_all.empty:
+        st.warning("No trades found for that wallet.")
+        st.stop()
+
+    # timestamp ms vs sec fix
+    if df_all["timestamp"].max() > 2_000_000_000_000:
+        df_all["timestamp"] = (df_all["timestamp"] / 1000).astype(int)
+        df_all["time_utc"] = pd.to_datetime(df_all["timestamp"], unit="s", utc=True)
+
+    # Attach a market key column (conditionId-like) for grouping
+    df_all["market_key"] = [
+        _trade_market_key(t) for t in trades
+    ]
+    df_all = df_all.dropna(subset=["market_key"]).copy()
+
+    df = _filter_df_by_range(df_all, rng)
+
+    # Mid prices (cap to keep it fast)
+    with st.spinner("Fetching mid prices (for open PnL estimates)…"):
+        mids = mid_prices_for_assets(df, cap=60)
+
+    # Total PnL (sum of per-market open estimates)
+    per_market = []
+    for mk, g in df.groupby("market_key"):
+        pnl_open, _ = pair_pnl_open_estimate(g, mids)
+        spent, received, _ = cashflows(g)
+        per_market.append({"market_key": mk, "pnl": float(pnl_open), "cost": float(spent), "trades": int(len(g))})
+    pm_df = pd.DataFrame(per_market).sort_values("pnl", ascending=False) if per_market else pd.DataFrame(columns=["market_key", "pnl", "cost", "trades"])
+
+    total_pnl = float(pm_df["pnl"].sum()) if not pm_df.empty else 0.0
+    st.subheader("Total PnL")
+    st.metric("TOTAL PnL (open est)", format_money(total_pnl))
+
+    # PnL curve (proxy)
+    curve = _pnl_series_from_trades(df, mids)
+    if not curve.empty:
+        ch = (
+            alt.Chart(curve)
+            .mark_line(strokeWidth=3)
+            .encode(
+                x=alt.X("time_utc:T", title="Time (UTC)"),
+                y=alt.Y("pnl:Q", title="PnL ($)"),
+                tooltip=[alt.Tooltip("time_utc:T", title="Time"), alt.Tooltip("pnl:Q", title="PnL ($)")],
+            )
+            .properties(height=260)
+            .interactive()
+        )
+        st.altair_chart(ch, use_container_width=True)
+    else:
+        st.info("Not enough data to draw a PnL curve for that range.")
+
+    st.write("---")
+    st.subheader("Trade Pairs (by market)")
+
+    # Build paired market cards
+    cards = []
+    for mk, g in df.groupby("market_key"):
+        meta = _market_meta_for_condition(str(mk))
+        title = meta.get("question") or meta.get("title") or str(mk)
+        # Subtitle: attempt to include slug + window
+        sub = meta.get("slug") or ""
+        # Cost and PnL
+        spent, received, _ = cashflows(g)
+        pnl_open, _ = pair_pnl_open_estimate(g, mids)
+
+        # Simple "worst/best" proxies using max_profit_loss_curves (within 15m-style markets this is meaningful)
+        g_tmp = g.copy()
+        # If market has start/end, we can normalize; otherwise, keep raw timestamps.
+        m_start, m_end = market_start_end_ts(meta) if meta else (None, None)
+        g_tmp = build_time_axis(g_tmp, m_start, m_end)
+        curves = max_profit_loss_curves(g_tmp)
+        worst = float(curves["max_loss"].min()) if not curves.empty else float(pnl_open)
+        best = float(curves["max_profit"].max()) if not curves.empty else float(pnl_open)
+
+        # Avg/Median: using pnl snapshots (proxy)
+        snaps = _pnl_series_from_trades(g_tmp, mids)
+        avg = float(snaps["pnl"].mean()) if not snaps.empty else float(pnl_open)
+        med = float(snaps["pnl"].median()) if not snaps.empty else float(pnl_open)
+
+        # Imbalance: which side has more net shares
+        nsh = net_shares_by_outcome(g)
+        up_sh = float(nsh.get("Up", 0.0))
+        down_sh = float(nsh.get("Down", 0.0))
+        if abs(up_sh) > abs(down_sh):
+            imb = "UP"
+        elif abs(down_sh) > abs(up_sh):
+            imb = "DOWN"
+        else:
+            imb = "EVEN"
+
+        # Flips: number of side changes (BUY/SELL) on the most traded outcome
+        flips = 0
+        try:
+            s = g.sort_values("timestamp", ascending=True)["side"].astype(str).tolist()
+            for i in range(1, len(s)):
+                if s[i] != s[i - 1]:
+                    flips += 1
+        except Exception:
+            flips = 0
+
+        df_trades_show = g.sort_values("timestamp", ascending=False).copy()
+        df_trades_show["time_utc"] = df_trades_show["time_utc"].astype(str)
+        df_trades_show = df_trades_show[["time_utc", "side", "outcome", "price", "size", "notional", "asset", "transactionHash"]]
+
+        cards.append({
+            "wallet": wallet,
+            "market": str(mk),
+            "title": title,
+            "subtitle": sub,
+            "pnl": float(pnl_open),
+            "cost": float(spent),
+            "worst": float(worst),
+            "best": float(best),
+            "avg": float(avg),
+            "median": float(med),
+            "imbalance": imb,
+            "flips": int(flips),
+            "df_trades": df_trades_show,
+        })
+
+    # Sort by most recent activity (best-effort)
+    cards = sorted(cards, key=lambda x: float(df[df["market_key"] == x["market"]]["timestamp"].max()) if not df.empty else 0.0, reverse=True)
+
+    if not cards:
+        st.info("No markets found for that range.")
+        st.stop()
+
+    for i, c in enumerate(cards):
+        _render_trade_card(c, key=f"card_{i}")
+        st.write("")
+
+
+# ============================
+# UI
+# ============================
+if str(getattr(st.session_state, "page", "market")) == "profile":
+    render_trader_profile_page()
+    st.stop()
+
+colA, colB = st.columns([2, 3])
+with colA:
+    wallet_in = st.text_input(
+        "Wallet (0x...)",
+        value=str(getattr(st.session_state, "prefill_wallet", "")) or "",
+        placeholder="0x1234...",
+    )
+with colB:
+    market_in = st.text_input(
+        "Market (slug / conditionId / URL)",
+        value=str(getattr(st.session_state, "prefill_market", "")) or "",
+    )
 
 st.divider()
 
